@@ -163,7 +163,7 @@ def cached_load_all():
     return load_all()
 
 
-@st.cache_resource(show_spinner="🤖 Training Random Forest model …")
+@st.cache_resource(show_spinner="🤖 Training XGBoost & Random Forest models …")
 def cached_train_model(_merged_df):
     predictor = DelayPredictor(n_estimators=100, max_depth=12)
     predictor.train(_merged_df)
@@ -229,7 +229,7 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("🤖 Model Info")
     if predictor.is_trained:
-        st.sidebar.success("Random Forest trained ✅")
+        st.sidebar.success("XGBoost (Proposed) & RF trained ✅")
         st.sidebar.metric("Training samples", f"{predictor.n_train:,}")
 
         # Train / test split description
@@ -243,23 +243,25 @@ def main():
         if predictor.test_mae is not None:
             st.sidebar.markdown("**Test MAE (min)**")
             mae_table = pd.DataFrame({
-                "Method": ["Timetable", "Persistence", "Random Forest"],
+                "Method": ["Timetable", "Persistence", "Random Forest", "XGBoost (Proposed)"],
                 "MAE": [
                     f"{predictor.tt_test_mae:.1f}" if predictor.tt_test_mae else "—",
                     f"{predictor.pers_test_mae:.1f}" if predictor.pers_test_mae else "—",
                     f"{predictor.test_mae:.1f}",
+                    f"{predictor.xgb_test_mae:.1f}" if predictor.xgb_test_mae else "—",
                 ],
             })
             st.sidebar.dataframe(mae_table, hide_index=True, use_container_width=True)
 
         # MAE by horizon bar chart
-        if predictor.mae_by_horizon:
-            st.sidebar.markdown("**RF MAE by horizon (stations ahead)**")
+        if predictor.mae_by_horizon_xgb or predictor.mae_by_horizon:
+            st.sidebar.markdown("**XGBoost MAE by horizon (stations ahead)**")
             horizon_df = pd.DataFrame({
-                "Horizon": list(predictor.mae_by_horizon.keys()),
-                "MAE (min)": list(predictor.mae_by_horizon.values()),
+                "Horizon": list(predictor.mae_by_horizon_xgb.keys()),
+                "XGBoost": list(predictor.mae_by_horizon_xgb.values()),
+                "Random Forest": [predictor.mae_by_horizon.get(k, np.nan) for k in predictor.mae_by_horizon_xgb.keys()],
             })
-            st.sidebar.bar_chart(horizon_df.set_index("Horizon"), height=180)
+            st.sidebar.bar_chart(horizon_df.set_index("Horizon"), height=200)
     else:
         st.sidebar.warning("Model not trained — insufficient data. "
                            "Baselines still work.")
@@ -327,7 +329,8 @@ def main():
     tt_preds   = timetable_baseline(n_upcoming)
     pers_preds = persistence_baseline(last_known_delay, n_upcoming)
 
-    # Random Forest + prediction intervals (req 10)
+    # XGBoost (Proposed) + Random Forest with intervals
+    xgb_preds = predictor.predict_upcoming_xgb(journey, revealed)
     rf_preds, rf_p10, rf_p90 = predictor.predict_upcoming_with_intervals(
         journey, revealed, max_stations=5
     )
@@ -339,9 +342,9 @@ def main():
     current_delay_css = delay_css_class(last_known_delay)
 
     if n_upcoming > 0:
-        next_rf_eta = compute_eta_str(journey.iloc[revealed]["sch_arr"], rf_preds[0])
+        next_xgb_eta = compute_eta_str(journey.iloc[revealed]["sch_arr"], xgb_preds[0])
     else:
-        next_rf_eta = "Journey complete"
+        next_xgb_eta = "Journey complete"
 
     mc1, mc2, mc3, mc4 = st.columns(4)
     with mc1:
@@ -356,20 +359,18 @@ def main():
                     f'<p class="{current_delay_css}">{current_delay_str}</p></div>',
                     unsafe_allow_html=True)
     with mc4:
-        st.markdown(f'<div class="metric-card"><h4>Next-Stn ETA (RF)</h4>'
-                    f'<p>{next_rf_eta}</p></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metric-card"><h4>Next-Stn ETA (XGBoost)</h4>'
+                    f'<p>{next_xgb_eta}</p></div>', unsafe_allow_html=True)
 
     st.markdown("")  # spacing
 
     # ==================================================================
-    #  PRECOMPUTE per-step RF predictions for the line chart (req 9)
-    #  and for showing per-row errors (req 8)
+    #  PRECOMPUTE per-step predictions for the line chart & table errors
     # ==================================================================
-    # At each step s (1..revealed), we stored what the model WOULD have
-    # predicted for station s.  Compute that now.
-    rf_pred_at_step  = [np.nan] * n_stations   # RF prediction for station i
-    pers_pred_at_step = [np.nan] * n_stations  # Persistence prediction
-    tt_pred_at_step   = [np.nan] * n_stations  # Timetable prediction (always 0)
+    xgb_pred_at_step  = [np.nan] * n_stations   # XGBoost prediction
+    rf_pred_at_step   = [np.nan] * n_stations   # RF prediction
+    pers_pred_at_step = [np.nan] * n_stations   # Persistence prediction
+    tt_pred_at_step   = [np.nan] * n_stations   # Timetable prediction (always 0)
 
     for step in range(1, revealed):
         # What was the last known delay just before revealing station `step`?
@@ -379,7 +380,11 @@ def main():
         tt_pred_at_step[step]   = 0.0
         pers_pred_at_step[step] = prev_d
 
-        rf_p = predictor.predict_upcoming(journey, step)
+        xgb_p = predictor.predict_upcoming_xgb(journey, step)
+        if len(xgb_p) > 0:
+            xgb_pred_at_step[step] = float(xgb_p[0])
+
+        rf_p = predictor.predict_upcoming_rf(journey, step)
         if len(rf_p) > 0:
             rf_pred_at_step[step] = float(rf_p[0])
 
@@ -396,9 +401,10 @@ def main():
         "<th>Delay</th>"
         "<th>TT ETA</th>"
         "<th>Pers ETA</th>"
+        "<th>XGB ETA</th>"
         "<th>RF ETA</th>"
         "<th>Range (p10–p90)</th>"
-        "<th>Err: TT/Pers/RF</th>"
+        "<th>Err: Pers/XGB/RF</th>"
         "<th>Status</th>"
         "</tr>"
     )
@@ -441,10 +447,10 @@ def main():
 
             # Error column
             if i >= 1 and not pd.isna(delay_val):
-                e_tt   = format_error(tt_pred_at_step[i], delay_val)
                 e_pers = format_error(pers_pred_at_step[i], delay_val)
+                e_xgb  = format_error(xgb_pred_at_step[i], delay_val)
                 e_rf   = format_error(rf_pred_at_step[i], delay_val)
-                err_cell = f"{e_tt} / {e_pers} / {e_rf}"
+                err_cell = f"{e_pers} / {e_xgb} / {e_rf}"
             else:
                 err_cell = "—"
 
@@ -460,6 +466,7 @@ def main():
                 f'<td>{sch_arr_str}</td>'
                 f'<td>{act_arr_str}</td>'
                 f'<td>{act_arr_str}</td>'
+                f'<td>{act_arr_str}</td>'
                 f'<td>—</td>'
                 f'<td>{err_cell}</td>'
                 f'<td>{status}</td>'
@@ -469,10 +476,9 @@ def main():
             # ---- UPCOMING ----
             idx = i - revealed
 
-            # Persistence ETA = sch_arr + last_known_delay (exact float,
-            # rounded to nearest minute by minutes_to_time_str).
             tt_eta   = compute_eta_str(stn["sch_arr"], tt_preds[idx])
             pers_eta = compute_eta_str(stn["sch_arr"], pers_preds[idx])
+            xgb_eta  = compute_eta_str(stn["sch_arr"], xgb_preds[idx])
             rf_eta   = compute_eta_str(stn["sch_arr"], rf_preds[idx])
 
             # Prediction range
@@ -490,7 +496,8 @@ def main():
                 f'<td class="delay-pend">⏳</td>'
                 f'<td>{tt_eta}</td>'
                 f'<td>{pers_eta}</td>'
-                f'<td><b>{rf_eta}</b></td>'
+                f'<td><b>{xgb_eta}</b></td>'
+                f'<td>{rf_eta}</td>'
                 f'<td style="font-size:0.78rem">{range_str}</td>'
                 f'<td class="delay-pend">—</td>'
                 f'<td>{status_text}</td>'
@@ -530,8 +537,17 @@ def main():
             actual_delays.append(np.nan)
     chart_df["Actual Delay"] = actual_delays
 
-    # RF predicted delay (for revealed: what was predicted before reveal;
-    # for upcoming: current prediction)
+    # XGBoost predicted delay
+    xgb_chart = []
+    for i in range(n_stations):
+        if i < revealed:
+            xgb_chart.append(xgb_pred_at_step[i])
+        else:
+            idx = i - revealed
+            xgb_chart.append(float(xgb_preds[idx]))
+    chart_df["XGBoost (Proposed)"] = xgb_chart
+
+    # RF predicted delay
     rf_chart = []
     for i in range(n_stations):
         if i < revealed:
@@ -539,7 +555,7 @@ def main():
         else:
             idx = i - revealed
             rf_chart.append(float(rf_preds[idx]))
-    chart_df["RF Predicted"] = rf_chart
+    chart_df["Random Forest"] = rf_chart
 
     # Persistence predicted
     pers_chart = []
@@ -567,6 +583,7 @@ def main():
         tt_errors   = []
         pers_errors = []
         rf_errors   = []
+        xgb_errors  = []
 
         for step in range(1, n_stations):
             actual_delay = journey.iloc[step]["arr_delay"]
@@ -579,24 +596,31 @@ def main():
             tt_errors.append(abs(0 - actual_delay))
             pers_errors.append(abs(prev_d - actual_delay))
 
-            rf_pred = predictor.predict_upcoming(journey, step)
-            if len(rf_pred) > 0:
-                rf_errors.append(abs(rf_pred[0] - actual_delay))
+            xgb_p = predictor.predict_upcoming_xgb(journey, step)
+            if len(xgb_p) > 0:
+                xgb_errors.append(abs(xgb_p[0] - actual_delay))
 
-        c1, c2, c3 = st.columns(3)
+            rf_p = predictor.predict_upcoming_rf(journey, step)
+            if len(rf_p) > 0:
+                rf_errors.append(abs(rf_p[0] - actual_delay))
+
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             mae_tt = np.mean(tt_errors) if tt_errors else float("nan")
-            st.metric("📅 Timetable MAE", f"{mae_tt:.1f} min")
+            st.metric("Timetable MAE", f"{mae_tt:.1f} min")
         with c2:
             mae_pers = np.mean(pers_errors) if pers_errors else float("nan")
-            st.metric("🔄 Persistence MAE", f"{mae_pers:.1f} min")
+            st.metric("Persistence MAE", f"{mae_pers:.1f} min")
         with c3:
             mae_rf = np.mean(rf_errors) if rf_errors else float("nan")
-            st.metric("🤖 Random Forest MAE", f"{mae_rf:.1f} min")
+            st.metric("Random Forest MAE", f"{mae_rf:.1f} min")
+        with c4:
+            mae_xgb = np.mean(xgb_errors) if xgb_errors else float("nan")
+            st.metric("XGBoost MAE (Proposed)", f"{mae_xgb:.1f} min")
 
         bar_data = pd.DataFrame({
-            "Method": ["Timetable", "Persistence", "Random Forest"],
-            "MAE (min)": [mae_tt, mae_pers, mae_rf],
+            "Method": ["Timetable", "Persistence", "Random Forest", "XGBoost (Proposed)"],
+            "MAE (min)": [mae_tt, mae_pers, mae_rf, mae_xgb],
         })
         st.bar_chart(bar_data.set_index("Method"), height=260)
         st.caption("**MAE** = Mean Absolute Error — average prediction miss "

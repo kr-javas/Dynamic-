@@ -65,7 +65,8 @@ The app opens at `http://localhost:8501`.
 |---|---|
 | **Timetable** (baseline) | Always predicts zero delay — the train is on time. |
 | **Persistence** (baseline) | The latest observed delay continues unchanged. |
-| **Random Forest** (ML) | Uses station sequence, distance, scheduled time, and past delays to predict future delays. |
+| **Random Forest** (ML baseline) | Ensemble of decision trees using route sequence, time, and history. |
+| **XGBoost** (Proposed Model) | Gradient boosted decision trees optimized for sequential delay prediction. |
 
 ### Key Design Decisions
 
@@ -85,7 +86,8 @@ After revealing all stations, the app shows:
 - **Python** — core language
 - **Streamlit** — interactive web interface
 - **Pandas / NumPy** — data wrangling
-- **Scikit-learn** — Random Forest model
+- **XGBoost** — proposed gradient boosting model
+- **Scikit-learn** — Random Forest model and evaluation metrics
 
 ## 👨‍🎓 Authors
 

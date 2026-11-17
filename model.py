@@ -12,6 +12,7 @@ All predictions output *delay in minutes*; the app converts that to ETA.
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
 
 
 # ============================================================================
@@ -124,43 +125,61 @@ def split_by_date(df: pd.DataFrame):
 
 
 # ============================================================================
-# 4.  RANDOM FOREST MODEL
+# 4.  MACHINE LEARNING MODELS (XGBoost Proposed & Random Forest)
 # ============================================================================
 
 class DelayPredictor:
     """
-    Wraps a scikit-learn RandomForestRegressor.
+    Wraps XGBoost Regressor (Proposed Model in Synopsis) and
+    RandomForestRegressor (Baseline ML Model).
 
     Usage:
         predictor = DelayPredictor()
-        predictor.train(merged_df)        # one-time training
-        preds = predictor.predict(X_new)  # predict delay in minutes
+        predictor.train(merged_df)
+        xgb_preds = predictor.predict_upcoming_xgb(journey_df, revealed_count)
+        rf_preds  = predictor.predict_upcoming_rf(journey_df, revealed_count)
     """
 
     def __init__(self, n_estimators: int = 100, max_depth: int = 12,
                  random_state: int = 42):
-        self.model = RandomForestRegressor(
+        self.rf_model = RandomForestRegressor(
             n_estimators=n_estimators,
             max_depth=max_depth,
             random_state=random_state,
-            n_jobs=-1,            # use all CPU cores
+            n_jobs=-1,
         )
+        self.xgb_model = xgb.XGBRegressor(
+            n_estimators=n_estimators,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+        self.model = self.rf_model  # Backwards compatibility
         self.is_trained = False
-        self.train_mae  = None
-        self.test_mae   = None
-        self.n_train    = 0
-        self.n_test     = 0
-        # Extra metadata stored during training for the sidebar
-        self.tt_test_mae   = None   # Timetable baseline MAE on test set
-        self.pers_test_mae = None   # Persistence baseline MAE on test set
-        self.train_date_range = ""  # e.g. "1-21 Sep"
-        self.test_date_range  = ""  # e.g. "22-30 Sep"
-        self.mae_by_horizon   = {}  # {horizon_label: rf_mae}
+        
+        # Performance metrics on train/test
+        self.train_mae = None      # RF train MAE
+        self.test_mae = None       # RF test MAE
+        self.xgb_train_mae = None  # XGB train MAE
+        self.xgb_test_mae = None   # XGB test MAE
+        self.n_train = 0
+        self.n_test = 0
+        
+        # Baselines
+        self.tt_test_mae = None
+        self.pers_test_mae = None
+        self.train_date_range = ""
+        self.test_date_range = ""
+        
+        # MAE by horizon
+        self.mae_by_horizon = {}      # RF
+        self.mae_by_horizon_xgb = {}  # XGB
 
     def train(self, merged_df: pd.DataFrame):
         """
         Build features, split by DATE (1-21 Sep train, 22-30 Sep test),
-        and fit the Random Forest. Stores train/test MAE for display.
+        and fit both XGBoost and Random Forest.
         """
         feat_df = build_features_for_training(merged_df)
         train_df, test_df = split_by_date(feat_df)
@@ -172,79 +191,69 @@ class DelayPredictor:
         X_train = train_df[FEATURE_COLS].fillna(0)
         y_train = train_df[TARGET_COL]
 
-        self.model.fit(X_train, y_train)
+        # 1. Train Random Forest
+        self.rf_model.fit(X_train, y_train)
+        self.model = self.rf_model
+
+        # 2. Train XGBoost (Proposed model)
+        self.xgb_model.fit(X_train, y_train)
+
         self.is_trained = True
-        self.n_train    = len(X_train)
+        self.n_train = len(X_train)
 
-        # Training MAE
-        self.train_mae = np.mean(np.abs(self.model.predict(X_train) - y_train))
+        # Training MAEs
+        self.train_mae = np.mean(np.abs(self.rf_model.predict(X_train) - y_train))
+        self.xgb_train_mae = np.mean(np.abs(self.xgb_model.predict(X_train) - y_train))
 
-        # Test MAE (if we have test data)
+        # Test MAEs (if test data available)
         if len(test_df) > 0:
             X_test = test_df[FEATURE_COLS].fillna(0)
             y_test = test_df[TARGET_COL]
-            self.test_mae = np.mean(np.abs(self.model.predict(X_test) - y_test))
-            self.n_test   = len(X_test)
+            self.n_test = len(X_test)
 
-            # --- Baseline MAEs on the same test set ---
-            self.tt_test_mae   = np.mean(np.abs(y_test))          # timetable predicts 0
-            self.pers_test_mae = np.mean(np.abs(
+            # ML Models Test MAE
+            rf_test_pred = self.rf_model.predict(X_test)
+            xgb_test_pred = self.xgb_model.predict(X_test)
+
+            self.test_mae = float(np.mean(np.abs(rf_test_pred - y_test)))
+            self.xgb_test_mae = float(np.mean(np.abs(xgb_test_pred - y_test)))
+
+            # Baseline MAEs on the same test set
+            self.tt_test_mae = float(np.mean(np.abs(y_test)))  # Timetable predicts 0
+            self.pers_test_mae = float(np.mean(np.abs(
                 test_df["prev_delay"].fillna(0).values - y_test.values
-            ))
+            )))
 
-            # --- Date ranges for display ---
+            # Date ranges for display
             self.train_date_range = f"1–{TRAIN_CUTOFF_DAY} Sep"
             self.test_date_range  = f"{TRAIN_CUTOFF_DAY + 1}–30 Sep"
 
-            # --- MAE by horizon (stations ahead) ---
+            # MAE by horizon (stations ahead)
             try:
-                # stn_seq minus the first revealed station in each journey
-                # gives horizon.  We approximate horizon as the row's
-                # position within the journey (0 = first predicted station).
                 test_copy = test_df.copy()
-                test_copy["_rf_pred"]  = self.model.predict(X_test)
-                test_copy["_rf_err"]   = np.abs(test_copy["_rf_pred"] - y_test.values)
-                # Compute within-journey rank (0-based) of each test row
-                test_copy["_rank"] = test_copy.groupby("journey_id").cumcount()
+                test_copy["_rf_err"]  = np.abs(rf_test_pred - y_test.values)
+                test_copy["_xgb_err"] = np.abs(xgb_test_pred - y_test.values)
+                test_copy["_rank"]    = test_copy.groupby("journey_id").cumcount()
+
                 for label, lo, hi in [("1", 0, 0), ("2", 1, 1), ("3", 2, 2),
                                        ("4", 3, 3), ("5+", 4, 9999)]:
                     mask = (test_copy["_rank"] >= lo) & (test_copy["_rank"] <= hi)
                     if mask.any():
-                        self.mae_by_horizon[label] = test_copy.loc[mask, "_rf_err"].mean()
+                        self.mae_by_horizon[label] = float(test_copy.loc[mask, "_rf_err"].mean())
+                        self.mae_by_horizon_xgb[label] = float(test_copy.loc[mask, "_xgb_err"].mean())
             except Exception:
                 pass
 
-    def predict_upcoming(self, journey_df: pd.DataFrame,
-                         revealed_count: int) -> np.ndarray:
-        """
-        Predict arrival delay for stations *after* the revealed ones.
-
-        Parameters
-        ----------
-        journey_df     : Full journey DataFrame (all stations, in order).
-        revealed_count : How many stations have been revealed so far.
-
-        Returns
-        -------
-        Array of predicted delays (minutes) for each upcoming station.
-        """
-        if not self.is_trained:
-            # Fallback: return zeros (same as timetable baseline)
-            n_upcoming = len(journey_df) - revealed_count
-            return np.zeros(max(n_upcoming, 0))
-
+    def _prepare_upcoming_features(self, journey_df: pd.DataFrame, revealed_count: int) -> pd.DataFrame:
+        """Helper to build upcoming feature matrix safely without data leakage."""
         upcoming = journey_df.iloc[revealed_count:].copy()
         if len(upcoming) == 0:
-            return np.array([])
+            return pd.DataFrame(columns=FEATURE_COLS)
 
-        # Build features for upcoming stations using only revealed info
-        # Last known delay from the most-recently revealed station
         if revealed_count > 0:
             last_delay = journey_df.iloc[revealed_count - 1]["arr_delay"]
             if pd.isna(last_delay):
                 last_delay = 0.0
-
-            # Average delay of all revealed stations
             revealed_delays = journey_df.iloc[:revealed_count]["arr_delay"].dropna()
             avg_delay = revealed_delays.mean() if len(revealed_delays) > 0 else 0.0
         else:
@@ -256,8 +265,33 @@ class DelayPredictor:
         upcoming["stn_seq"]     = upcoming["stnSerialNumber"]
         upcoming["sch_arr_min"] = upcoming["sch_arr"].apply(_time_to_minutes)
 
-        X = upcoming[FEATURE_COLS].fillna(0)
-        return self.model.predict(X)
+        return upcoming[FEATURE_COLS].fillna(0)
+
+    def predict_upcoming_xgb(self, journey_df: pd.DataFrame, revealed_count: int) -> np.ndarray:
+        """Predict upcoming delays using XGBoost (Proposed model)."""
+        if not self.is_trained:
+            n_upcoming = len(journey_df) - revealed_count
+            return np.zeros(max(n_upcoming, 0))
+
+        X = self._prepare_upcoming_features(journey_df, revealed_count)
+        if len(X) == 0:
+            return np.array([])
+        return self.xgb_model.predict(X)
+
+    def predict_upcoming_rf(self, journey_df: pd.DataFrame, revealed_count: int) -> np.ndarray:
+        """Predict upcoming delays using Random Forest."""
+        if not self.is_trained:
+            n_upcoming = len(journey_df) - revealed_count
+            return np.zeros(max(n_upcoming, 0))
+
+        X = self._prepare_upcoming_features(journey_df, revealed_count)
+        if len(X) == 0:
+            return np.array([])
+        return self.rf_model.predict(X)
+
+    def predict_upcoming(self, journey_df: pd.DataFrame, revealed_count: int) -> np.ndarray:
+        """Default predict function (points to XGBoost proposed model)."""
+        return self.predict_upcoming_xgb(journey_df, revealed_count)
 
     def predict_upcoming_with_intervals(self, journey_df: pd.DataFrame,
                                          revealed_count: int,
