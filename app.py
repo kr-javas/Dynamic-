@@ -24,8 +24,8 @@ from model import (
 #  PAGE CONFIG & CUSTOM CSS
 # ============================================================================
 st.set_page_config(
-    page_title="🚂 Dynamic Train ETA Prediction",
-    page_icon="🚂",
+    page_title="Dynamic Train ETA Prediction",
+    page_icon="🚆",
     layout="wide",
 )
 
@@ -176,7 +176,7 @@ def cached_train_model(_merged_df):
 
 def main():
     # ---- Title + info banner (req 1) ----
-    st.title("🚂 Dynamic Train ETA Prediction")
+    st.title("Dynamic Train ETA Prediction")
     st.markdown(
         '<div class="info-banner">'
         '📡 Replay of historical data <b>(Sept 2024)</b>, not a live feed.&ensp;'
@@ -278,7 +278,7 @@ def main():
     if pd.isna(origin_name): origin_name = origin_stn
     if pd.isna(dest_name):   dest_name = dest_stn
 
-    st.subheader(f"🛤️ {train_name} ({selected_train}) — "
+    st.subheader(f"{train_name} ({selected_train}) — "
                  f"{selected_date.strftime('%d %b %Y')}")
     st.write(f"**Route:** {origin_name} → {dest_name}  |  "
              f"**Stops:** {n_stations}  |  "
@@ -293,25 +293,17 @@ def main():
     if journey_key not in st.session_state:
         st.session_state[journey_key] = 1
 
-    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+    col_b1, col_b2 = st.columns(2)
     with col_b1:
-        if st.button("⏮️ Reset", use_container_width=True):
-            st.session_state[journey_key] = 1
-            st.rerun()
-    with col_b2:
         if st.button("⏪ Back", use_container_width=True):
             if st.session_state[journey_key] > 1:
                 st.session_state[journey_key] -= 1
                 st.rerun()
-    with col_b3:
+    with col_b2:
         if st.button("▶️ Next Station", type="primary", use_container_width=True):
             if st.session_state[journey_key] < n_stations:
                 st.session_state[journey_key] += 1
                 st.rerun()
-    with col_b4:
-        if st.button("⏭️ Show All", use_container_width=True):
-            st.session_state[journey_key] = n_stations
-            st.rerun()
 
     revealed = st.session_state[journey_key]
 
