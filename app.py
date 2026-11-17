@@ -46,9 +46,9 @@ st.markdown("""
 .delay-red    { color: #c0392b; font-weight: 600; }
 .delay-pend   { color: #888; }
 
-/* Row highlights */
-.row-current  { background: #e8f5e9 !important; }
-.row-next     { background: #fff8e1 !important; }
+/* Row highlights — dark text forced for readability in any theme */
+.row-current td { background: #c8e6c9 !important; color: #1b5e20 !important; }
+.row-next    td { background: #fff3cd !important; color: #664d03 !important; }
 
 /* Info banner */
 .info-banner {
@@ -60,8 +60,19 @@ st.markdown("""
 /* Smaller station zone text */
 .zone-text { font-size: 0.72rem; color: #999; }
 
-/* Table tweaks */
-table { font-size: 0.85rem !important; }
+/* Table tweaks — no wrap, dark readable text, compact */
+table.eta-table { font-size: 0.84rem !important; width: 100%;
+                  border-collapse: collapse; }
+table.eta-table th, table.eta-table td {
+    white-space: nowrap; padding: 5px 7px; text-align: left;
+}
+table.eta-table thead th {
+    background: #343a40 !important; color: #f8f9fa !important;
+    font-weight: 600; font-size: 0.8rem;
+}
+table.eta-table tbody tr:nth-child(even) { background: #fafafa; }
+table.eta-table tbody tr:hover { background: #e9ecef; }
+table.eta-table tbody td { color: #212529; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -78,15 +89,14 @@ def time_to_minutes(t) -> float:
 
 
 def minutes_to_time_str(minutes: float) -> str:
-    """Convert minutes since midnight → '8:32 AM' style string."""
+    """Convert minutes since midnight → '09:32' (24-hour HH:MM) string.
+    Rounds to the nearest minute so fractional delays display correctly."""
     if pd.isna(minutes) or minutes is None:
         return "—"
-    minutes = float(minutes)
-    h = int(minutes // 60) % 24
-    m = int(minutes % 60)
-    period = "AM" if h < 12 else "PM"
-    display_h = h % 12 or 12
-    return f"{display_h}:{m:02d} {period}"
+    total = round(float(minutes))          # ← round, not truncate
+    h = (total // 60) % 24
+    m = total % 60
+    return f"{h:02d}:{m:02d}"
 
 
 def format_delay_short(delay_min) -> str:
@@ -387,18 +397,17 @@ def main():
     # Build rows as HTML for colour-coding and compact layout.
     header = (
         "<tr>"
-        "<th style='width:3%'>#</th>"
-        "<th style='width:14%'>Station</th>"
-        "<th style='width:5%'>Dist</th>"
-        "<th style='width:8%'>Scheduled</th>"
-        "<th style='width:8%'>Actual</th>"
-        "<th style='width:7%'>Delay</th>"
-        "<th style='width:8%'>TT ETA</th>"
-        "<th style='width:8%'>Persist ETA</th>"
-        "<th style='width:8%'>RF ETA</th>"
-        "<th style='width:11%'>Range (p10-p90)</th>"
-        "<th style='width:12%'>Err: TT / Pers / RF</th>"
-        "<th style='width:5%'>Status</th>"
+        "<th>#</th>"
+        "<th>Station</th>"
+        "<th>Sched</th>"
+        "<th>Actual</th>"
+        "<th>Delay</th>"
+        "<th>TT ETA</th>"
+        "<th>Pers ETA</th>"
+        "<th>RF ETA</th>"
+        "<th>Range (p10–p90)</th>"
+        "<th>Err: TT/Pers/RF</th>"
+        "<th>Status</th>"
         "</tr>"
     )
 
@@ -409,19 +418,19 @@ def main():
         stn_name = stn.get("station_name", stn_code)
         if pd.isna(stn_name):
             stn_name = stn_code
-        distance = stn["distance"]
         zone     = zones.get(stn_code, "")
 
+        # 24-hour HH:MM format for schedule/actual times
         sch_arr_str = (
-            stn["sch_arr"].strftime("%I:%M %p") if isinstance(stn["sch_arr"], dt_time) else "—"
+            stn["sch_arr"].strftime("%H:%M") if isinstance(stn["sch_arr"], dt_time) else "—"
         )
         serial = stn.get("stnSerialNumber", i + 1)
 
-        # Station cell: name + zone underneath (req 3)
+        # Station cell: name + zone underneath
         zone_html = f'<span class="zone-text">{zone}</span>' if zone else ""
         stn_cell = f"{stn_name} ({stn_code})<br>{zone_html}"
 
-        # Row highlight class (req 5)
+        # Row highlight class
         row_class = ""
         if i == revealed - 1:
             row_class = "row-current"
@@ -431,14 +440,14 @@ def main():
         if i < revealed:
             # ---- REVEALED ----
             act_arr_str = (
-                stn["act_arr"].strftime("%I:%M %p")
+                stn["act_arr"].strftime("%H:%M")
                 if isinstance(stn["act_arr"], dt_time) else "—"
             )
             delay_val = stn["arr_delay"]
             delay_str = format_delay_short(delay_val)
             css = delay_css_class(delay_val)
 
-            # Error column (req 8)
+            # Error column
             if i >= 1 and not pd.isna(delay_val):
                 e_tt   = format_error(tt_pred_at_step[i], delay_val)
                 e_pers = format_error(pers_pred_at_step[i], delay_val)
@@ -453,7 +462,6 @@ def main():
                 f'<tr class="{row_class}">'
                 f'<td>{serial}</td>'
                 f'<td>{stn_cell}</td>'
-                f'<td>{distance:.0f}</td>'
                 f'<td>{sch_arr_str}</td>'
                 f'<td>{act_arr_str}</td>'
                 f'<td class="{css}">{delay_str}</td>'
@@ -469,18 +477,13 @@ def main():
             # ---- UPCOMING ----
             idx = i - revealed
 
-            # BUG FIX (req 11):  persistence ETA now correctly uses
-            # sch_arr + last_known_delay (pers_preds[idx] IS the
-            # last_known_delay).  Previously the code was fine in
-            # model.py, but the displayed ETA was wrong when
-            # last_known_delay was fractional and got rounded to 0
-            # during time→str conversion.  We now keep full float
-            # precision through compute_eta_str.
+            # Persistence ETA = sch_arr + last_known_delay (exact float,
+            # rounded to nearest minute by minutes_to_time_str).
             tt_eta   = compute_eta_str(stn["sch_arr"], tt_preds[idx])
             pers_eta = compute_eta_str(stn["sch_arr"], pers_preds[idx])
             rf_eta   = compute_eta_str(stn["sch_arr"], rf_preds[idx])
 
-            # Prediction range (req 10)
+            # Prediction range
             range_str = compute_eta_range_str(stn["sch_arr"],
                                                rf_p10[idx], rf_p90[idx])
 
@@ -490,7 +493,6 @@ def main():
                 f'<tr class="{row_class}">'
                 f'<td>{serial}</td>'
                 f'<td>{stn_cell}</td>'
-                f'<td>{distance:.0f}</td>'
                 f'<td>{sch_arr_str}</td>'
                 f'<td class="delay-pend">⏳</td>'
                 f'<td class="delay-pend">⏳</td>'
@@ -505,8 +507,8 @@ def main():
 
     table_html = (
         '<div style="overflow-x:auto;">'
-        '<table style="width:100%; border-collapse:collapse; font-size:0.84rem;">'
-        f'<thead style="background:#f1f3f5;">{header}</thead>'
+        '<table class="eta-table">'
+        f'<thead>{header}</thead>'
         f'<tbody>{"".join(body_rows)}</tbody>'
         '</table></div>'
     )

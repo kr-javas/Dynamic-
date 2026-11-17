@@ -12,7 +12,6 @@ All predictions output *delay in minutes*; the app converts that to ETA.
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import GroupShuffleSplit
 
 
 # ============================================================================
@@ -95,28 +94,33 @@ TARGET_COL   = "arr_delay"
 
 
 # ============================================================================
-# 3.  TRAIN / TEST SPLIT  (by journey, not by row)
+# 3.  TRAIN / TEST SPLIT  (by DATE — train 1-21 Sep, test 22-30 Sep)
 # ============================================================================
 
-def split_by_journey(df: pd.DataFrame, test_size: float = 0.2,
-                     random_state: int = 42):
+TRAIN_CUTOFF_DAY = 21   # Train on days 1–21, test on days 22–30
+
+def split_by_date(df: pd.DataFrame):
     """
-    Split data by journey_id so that all stations from one journey stay
-    together in either train or test set.  This prevents data leakage
-    from future stations leaking into the training set.
+    Split data by calendar date so the model trains on the first three
+    weeks of September and is tested on the last week.
+
+    This is a temporal split: train on Sep 1–21, test on Sep 22–30.
+    All stations from one journey stay together because every row in
+    a journey shares the same date.
     """
-    # Remove rows where target or key features are missing
     clean = df.dropna(subset=[TARGET_COL, "prev_delay"]).copy()
 
     if len(clean) < 20:
-        return clean, pd.DataFrame(), None, None
+        return clean, pd.DataFrame()
 
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size,
-                           random_state=random_state)
-    groups = clean["journey_id"]
-
-    train_idx, test_idx = next(gss.split(clean, groups=groups))
-    return clean.iloc[train_idx], clean.iloc[test_idx], train_idx, test_idx
+    # Extract the journey date from journey_id ("12303_2024-09-02")
+    clean["_date"] = pd.to_datetime(
+        clean["journey_id"].str.split("_").str[1], errors="coerce"
+    )
+    train_mask = clean["_date"].dt.day <= TRAIN_CUTOFF_DAY
+    train_df = clean.loc[train_mask].drop(columns=["_date"])
+    test_df  = clean.loc[~train_mask].drop(columns=["_date"])
+    return train_df, test_df
 
 
 # ============================================================================
@@ -155,14 +159,13 @@ class DelayPredictor:
 
     def train(self, merged_df: pd.DataFrame):
         """
-        Build features, split by journey, and fit the Random Forest.
-        Stores train/test MAE for display in the app.
+        Build features, split by DATE (1-21 Sep train, 22-30 Sep test),
+        and fit the Random Forest. Stores train/test MAE for display.
         """
         feat_df = build_features_for_training(merged_df)
-        train_df, test_df, _, _ = split_by_journey(feat_df)
+        train_df, test_df = split_by_date(feat_df)
 
         if len(train_df) < 10:
-            # Not enough data to train
             self.is_trained = False
             return
 
@@ -190,24 +193,8 @@ class DelayPredictor:
             ))
 
             # --- Date ranges for display ---
-            try:
-                train_dates = pd.to_datetime(
-                    train_df["journey_id"].str.split("_").str[1]
-                )
-                test_dates = pd.to_datetime(
-                    test_df["journey_id"].str.split("_").str[1]
-                )
-                self.train_date_range = (
-                    f"{train_dates.min().day}–"
-                    f"{train_dates.max().day} {train_dates.max().strftime('%b')}"
-                )
-                self.test_date_range = (
-                    f"{test_dates.min().day}–"
-                    f"{test_dates.max().day} {test_dates.max().strftime('%b')}"
-                )
-            except Exception:
-                self.train_date_range = "~80%"
-                self.test_date_range  = "~20%"
+            self.train_date_range = f"1–{TRAIN_CUTOFF_DAY} Sep"
+            self.test_date_range  = f"{TRAIN_CUTOFF_DAY + 1}–30 Sep"
 
             # --- MAE by horizon (stations ahead) ---
             try:
