@@ -146,6 +146,12 @@ class DelayPredictor:
         self.test_mae   = None
         self.n_train    = 0
         self.n_test     = 0
+        # Extra metadata stored during training for the sidebar
+        self.tt_test_mae   = None   # Timetable baseline MAE on test set
+        self.pers_test_mae = None   # Persistence baseline MAE on test set
+        self.train_date_range = ""  # e.g. "1-21 Sep"
+        self.test_date_range  = ""  # e.g. "22-30 Sep"
+        self.mae_by_horizon   = {}  # {horizon_label: rf_mae}
 
     def train(self, merged_df: pd.DataFrame):
         """
@@ -176,6 +182,50 @@ class DelayPredictor:
             y_test = test_df[TARGET_COL]
             self.test_mae = np.mean(np.abs(self.model.predict(X_test) - y_test))
             self.n_test   = len(X_test)
+
+            # --- Baseline MAEs on the same test set ---
+            self.tt_test_mae   = np.mean(np.abs(y_test))          # timetable predicts 0
+            self.pers_test_mae = np.mean(np.abs(
+                test_df["prev_delay"].fillna(0).values - y_test.values
+            ))
+
+            # --- Date ranges for display ---
+            try:
+                train_dates = pd.to_datetime(
+                    train_df["journey_id"].str.split("_").str[1]
+                )
+                test_dates = pd.to_datetime(
+                    test_df["journey_id"].str.split("_").str[1]
+                )
+                self.train_date_range = (
+                    f"{train_dates.min().day}–"
+                    f"{train_dates.max().day} {train_dates.max().strftime('%b')}"
+                )
+                self.test_date_range = (
+                    f"{test_dates.min().day}–"
+                    f"{test_dates.max().day} {test_dates.max().strftime('%b')}"
+                )
+            except Exception:
+                self.train_date_range = "~80%"
+                self.test_date_range  = "~20%"
+
+            # --- MAE by horizon (stations ahead) ---
+            try:
+                # stn_seq minus the first revealed station in each journey
+                # gives horizon.  We approximate horizon as the row's
+                # position within the journey (0 = first predicted station).
+                test_copy = test_df.copy()
+                test_copy["_rf_pred"]  = self.model.predict(X_test)
+                test_copy["_rf_err"]   = np.abs(test_copy["_rf_pred"] - y_test.values)
+                # Compute within-journey rank (0-based) of each test row
+                test_copy["_rank"] = test_copy.groupby("journey_id").cumcount()
+                for label, lo, hi in [("1", 0, 0), ("2", 1, 1), ("3", 2, 2),
+                                       ("4", 3, 3), ("5+", 4, 9999)]:
+                    mask = (test_copy["_rank"] >= lo) & (test_copy["_rank"] <= hi)
+                    if mask.any():
+                        self.mae_by_horizon[label] = test_copy.loc[mask, "_rf_err"].mean()
+            except Exception:
+                pass
 
     def predict_upcoming(self, journey_df: pd.DataFrame,
                          revealed_count: int) -> np.ndarray:
@@ -221,3 +271,57 @@ class DelayPredictor:
 
         X = upcoming[FEATURE_COLS].fillna(0)
         return self.model.predict(X)
+
+    def predict_upcoming_with_intervals(self, journey_df: pd.DataFrame,
+                                         revealed_count: int,
+                                         max_stations: int = 5):
+        """
+        Like predict_upcoming but also returns 10th/90th percentile
+        prediction ranges from individual trees (for uncertainty display).
+
+        Returns (mean_preds, p10, p90) — each an ndarray.
+        Only computes intervals for the first `max_stations` upcoming
+        stations to keep it fast.
+        """
+        n_upcoming = len(journey_df) - revealed_count
+        if not self.is_trained or n_upcoming == 0:
+            z = np.zeros(max(n_upcoming, 0))
+            return z, z, z
+
+        upcoming = journey_df.iloc[revealed_count:].copy()
+
+        # Build features (same logic as predict_upcoming)
+        if revealed_count > 0:
+            last_delay = journey_df.iloc[revealed_count - 1]["arr_delay"]
+            if pd.isna(last_delay):
+                last_delay = 0.0
+            revealed_delays = journey_df.iloc[:revealed_count]["arr_delay"].dropna()
+            avg_delay = revealed_delays.mean() if len(revealed_delays) > 0 else 0.0
+        else:
+            last_delay = 0.0
+            avg_delay  = 0.0
+
+        upcoming["prev_delay"]  = last_delay
+        upcoming["cumul_delay"] = avg_delay
+        upcoming["stn_seq"]     = upcoming["stnSerialNumber"]
+        upcoming["sch_arr_min"] = upcoming["sch_arr"].apply(_time_to_minutes)
+
+        X = upcoming[FEATURE_COLS].fillna(0)
+
+        mean_preds = self.model.predict(X)
+
+        # Tree-level predictions for interval (only first max_stations)
+        X_subset = X.iloc[:max_stations]
+        tree_preds = np.array([
+            t.predict(X_subset.values) for t in self.model.estimators_
+        ])
+        p10 = np.percentile(tree_preds, 10, axis=0)
+        p90 = np.percentile(tree_preds, 90, axis=0)
+
+        # Pad to full length with NaN beyond max_stations
+        p10_full = np.full(n_upcoming, np.nan)
+        p90_full = np.full(n_upcoming, np.nan)
+        p10_full[:len(p10)] = p10
+        p90_full[:len(p90)] = p90
+
+        return mean_preds, p10_full, p90_full
