@@ -295,12 +295,12 @@ def main():
 
     col_b1, col_b2 = st.columns(2)
     with col_b1:
-        if st.button("⏪ Back", use_container_width=True):
+        if st.button("Back", use_container_width=True):
             if st.session_state[journey_key] > 1:
                 st.session_state[journey_key] -= 1
                 st.rerun()
     with col_b2:
-        if st.button("▶️ Next Station", type="primary", use_container_width=True):
+        if st.button("Next Station", type="primary", use_container_width=True):
             if st.session_state[journey_key] < n_stations:
                 st.session_state[journey_key] += 1
                 st.rerun()
